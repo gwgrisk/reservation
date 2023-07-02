@@ -33,7 +33,12 @@ enum ReservationStatus {
     BLOCKED = 3;
 }
 
-
+enum ReservationUpdateType{
+    UNKNOWN = 0;
+    CREATE = 1;
+    UPDATE = 2;
+    DELETE = 3;
+}
 
 message Reservation {
     string id = 1;
@@ -98,6 +103,12 @@ message QueryRequest {
     google.protobuf.Timestamp end = 5;
 }
 
+message ListenRequest {}
+message ListenResponse {
+    ReservationUpdateType op = 1;
+    Reservation reservation = 2;
+}
+
 service ReservationService {
     rpc reserve(ReserveRequest) returns (ReserveResponse);
     rpc confirm(ConfirmRequest) returns (ConfirmResponse);
@@ -105,7 +116,76 @@ service ReservationService {
     rpc cancel(ConfirmRequest) returns (ConfirmResponse);
     rpc get(GetRequest) returns (GetResponse);
     rpc query(QueryRequest) returns (stream Reservation);
+    // another system could monitor newly added/canceled/comfirmed reservations
+    rpc listen(ListenRequest) returns (stream Reservation);
 }
+```
+
+### Database schema
+
+We use postgres as the database. Below is the schema:
+
+```sql
+CREATE SCHEMA rsvp;
+CREATE TYPE rsvp.reservation_status AS ENUM ('UNKNOWN', 'PENDING', 'CONFIRMED', 'BLOCKED');
+CREATE TYPE rsvp.reservation_update_type AS ENUM ('UNKNOWN', 'CREATE', 'UPDATE', 'DELETE');
+
+CREATE TABLE rsvp.reservations (
+    id uuid NOT NULL DEFAULT uuid_generate_v4(),
+    uesr_id VARCHAR(64) NOT NULL,
+    status rsvp.reservation_status NOT NULL DEFAULT 'PENDING',
+
+    resource_id VARCHAR(64) NOT NULL,
+    timespan tstzrange NOT NULL,
+
+    note text ,
+
+    CONSTRAINT reservation_pk PRIMARY KEY (id),
+    CONSTRAINT reservation_conflict EXCLUDE USING gist (resource_id WITH =, timespan WITH &&)
+);
+
+
+CREATE INDEX reservation_resource_id_idx ON rsvp.reservations (resource_id);
+CREATE INDEX reservation_user_id_idx ON rsvp.reservations (user_id);
+
+
+-- if user_id is null,find all reservations within during for the resource
+-- if resource_id is null, find all reservations within during for the user
+-- if both user_id and resource_id are null, find all reservations within during
+-- if both user_id and resource_id are not null, find all reservations within during for the user and resource
+CREATE OR REPLACE FUNCTION rsvp.query(uid text,rid text,during tstzrange) RETURNS TABLE
+rsvp.reservations AS  $$ $$ LANGUAGE plpgsql;
+
+-- reservation change queue
+CREATE TABLE rsvp.reservation_changes (
+    id SERIAL NOT NULL,
+    reservation_id uuid NOT NULL,
+    op rsvp.reservation_update_type NOT NULL,
+);
+
+-- trigger for add/update/delete reservation
+CREATE OR REPLACE FUNCTION rsvp.reservations_trigger() RETURNS TRIGGER AS
+$$
+BEGIN
+    IF (TG_OP = 'INSERT') THEN
+        -- update reservation_changes
+        INSERT INTO rsvp.reservation_changes (reservation_id,op) VALUES (NEW.id,'CREATE');
+    ELSIF (TG_OP = 'UPDATE') THEN
+        -- if status changes, update reservation_changes
+        IF (OLD.status != NEW.status) THEN
+            INSERT INTO rsvp.reservation_changes (reservation_id,op) VALUES (NEW.id,'UPDATE');
+        END IF;
+    ELSIF (TG_OP = 'DELETE') THEN
+        -- update reservation_changes
+        INSERT INTO rsvp.reservation_changes (reservation_id,op) VALUES (OLD.id,'DELETE');
+    END IF;
+    -- notify a channel called reservation_update
+    NOTIFY reservation_update
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER reservations_trigger AFTER INSERT OR UPDATE OR DELETE ON rsvp.reservations
+FOR EACH ROW EXECUTE PROCEDURE rsvp.reservations_trigger();
 ```
 
 Explain the proposal as if it was already included in the language and you were teaching it to another Rust programmer. That generally means:
